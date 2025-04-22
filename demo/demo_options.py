@@ -66,7 +66,12 @@ class DemoOptions():
         parser.add_argument("--renderer_type", type=str, default="opengl", 
             choices=['pytorch3d', 'opendr', 'opengl_gui', 'opengl'], help="type of renderer to use")
         
+        # Cobot Telekinesis
+        parser.add_argument("--cobot", action='store_true', help="Use cobot telekinesis")
 
+        # Mesh visualizer
+        parser.add_argument("--visualize", action='store_true', help="Visualize the mesh")
+        
         self.parser = parser
     
 

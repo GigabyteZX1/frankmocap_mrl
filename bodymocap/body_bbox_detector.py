@@ -35,7 +35,7 @@ class BodyPoseEstimator(object):
     def __load_body_estimator(self):
         net = PoseEstimationWithMobileNet()
         pose2d_checkpoint = "./extra_data/body_module/body_pose_estimator/checkpoint_iter_370000.pth"
-        checkpoint = torch.load(pose2d_checkpoint, map_location='cpu')
+        checkpoint = torch.load(pose2d_checkpoint, map_location='cpu', weights_only = True)
         load_state(net, checkpoint)
         net = net.eval()
         net = net.cuda()
@@ -59,13 +59,27 @@ class BodyPoseEstimator(object):
 
         stages_output = self.model(tensor_img)
 
-        stage2_heatmaps = stages_output[-2]
-        heatmaps = np.transpose(stage2_heatmaps.squeeze().cpu().data.numpy(), (1, 2, 0))
-        heatmaps = cv2.resize(heatmaps, (0, 0), fx=upsample_ratio, fy=upsample_ratio, interpolation=cv2.INTER_CUBIC)
+        stage2_heatmaps = stages_output[-2].detach()
+        # heatmaps = np.transpose(stage2_heatmaps.squeeze().cpu().data.numpy(), (1, 2, 0))
+        # heatmaps = cv2.resize(heatmaps, (0, 0), fx=upsample_ratio, fy=upsample_ratio, interpolation=cv2.INTER_CUBIC)
 
-        stage2_pafs = stages_output[-1]
-        pafs = np.transpose(stage2_pafs.squeeze().cpu().data.numpy(), (1, 2, 0))
-        pafs = cv2.resize(pafs, (0, 0), fx=upsample_ratio, fy=upsample_ratio, interpolation=cv2.INTER_CUBIC)
+        heatmaps = torch.nn.functional.interpolate(
+                        stage2_heatmaps,
+                        scale_factor=upsample_ratio,
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze().cpu().numpy().transpose(1, 2, 0)
+
+        stage2_pafs = stages_output[-1].detach()
+        # pafs = np.transpose(stage2_pafs.squeeze().cpu().data.numpy(), (1, 2, 0))
+        # pafs = cv2.resize(pafs, (0, 0), fx=upsample_ratio, fy=upsample_ratio, interpolation=cv2.INTER_CUBIC)
+
+        pafs = torch.nn.functional.interpolate(
+                        stage2_pafs,
+                        scale_factor=upsample_ratio,
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze().cpu().numpy().transpose(1, 2, 0)
 
         return heatmaps, pafs, scale, pad
     

@@ -7,10 +7,6 @@ import torch
 from torchvision.transforms import Normalize
 import numpy as np
 import cv2
-import argparse
-import json
-import pickle
-from datetime import datetime
 
 from demo.demo_options import DemoOptions
 from bodymocap.body_mocap_api import BodyMocap
@@ -19,12 +15,18 @@ import mocap_utils.demo_utils as demo_utils
 import mocap_utils.general_utils as gnu
 from mocap_utils.timer import Timer
 
-from renderer.viewer2D import ImShow
+
+from mrl_cobot.telekinesis_utils import CobotTelekinesis
+from renderer import glViewer
 
 def run_body_mocap(args, body_bbox_detector, body_mocap, visualizer):
     #Setup input data to handle different types of inputs
     input_type, input_data = demo_utils.setup_input(args)
-
+    cobot_utils = CobotTelekinesis()
+    #Connect to cobot
+    if args.cobot:
+        cobot_utils.connect_to_cobot(('localhost', 60001))
+    
     cur_frame = args.start_frame
     video_frame = 0
     timer = Timer()
@@ -51,7 +53,6 @@ def run_body_mocap(args, body_bbox_detector, body_mocap, visualizer):
                 openpose_imgcoord, _ = demo_utils.read_openpose_wHand(openpose_file_path,dataset='coco')      #25, 3       #TODO: this works for single person in the image
                 assert openpose_imgcoord is not None
 
-
         elif input_type == 'bbox_dir':
             if cur_frame < len(input_data):
                 print("Use pre-computed bounding boxes")
@@ -65,16 +66,18 @@ def run_body_mocap(args, body_bbox_detector, body_mocap, visualizer):
 
         elif input_type == 'video':      
             _, img_original_bgr = input_data.read()
+            img_original_bgr = cv2.resize(img_original_bgr, (526, 526))
             if video_frame < cur_frame:
                 video_frame += 1
                 continue
             # save the obtained video frames
-            image_path = osp.join(args.out_dir, "frames", f"{cur_frame:05d}.jpg")
-            if img_original_bgr is not None:
-                video_frame += 1
-                if args.save_frame:
-                    gnu.make_subdir(image_path)
-                    cv2.imwrite(image_path, img_original_bgr)
+            if args.out_dir is not None:
+                image_path = osp.join(args.out_dir, "frames", f"{cur_frame:05d}.jpg")
+                if img_original_bgr is not None:
+                    video_frame += 1
+                    if args.save_frame:
+                        gnu.make_subdir(image_path)
+                        cv2.imwrite(image_path, img_original_bgr)
 
         elif input_type == 'webcam':    
             _, img_original_bgr = input_data.read()
@@ -107,6 +110,8 @@ def run_body_mocap(args, body_bbox_detector, body_mocap, visualizer):
         # save the obtained body & hand bbox to json file
         if args.save_bbox_output: 
             demo_utils.save_info_to_json(args, image_path, body_bbox_list, hand_bbox_list)
+            timer.toc(bPrint=True, title="Save bbox")
+            continue
 
         if len(body_bbox_list) < 1: 
             print(f"No body deteced: {image_path}")
@@ -127,32 +132,53 @@ def run_body_mocap(args, body_bbox_detector, body_mocap, visualizer):
             pred_output_list = body_mocap.regress(img_original_bgr, body_bbox_list)
         assert len(body_bbox_list) == len(pred_output_list)
 
-        # extract mesh for rendering (vertices in image space and faces) from pred_output_list
-        pred_mesh_list = demo_utils.extract_mesh_from_output(pred_output_list)
-
-        # visualization
-        res_img = visualizer.visualize(
-            img_original_bgr,
-            pred_mesh_list = pred_mesh_list, 
-            body_bbox_list = body_bbox_list)
-
+        res_img = img_original_bgr
+        
         # show result in the screen
+        joint_indices = [0, 6, 9, 14, 17, 19, 21]
+        joint_positions_indices = [39, 31]
+        cobot_utils.proc_time()
+        joint_rotations = cobot_utils.extract_joint_data(pred_output_list[0]["pred_body_pose"][0], joint_indices, 1)
+        #print("DEBUG pred_output_list[0]:", pred_output_list[0].keys())
+        joint_positions = cobot_utils.extract_joint_data(pred_output_list[0]["pred_joints_img"], joint_positions_indices, 0)
+        cobot_utils.proc_time(1)
+        r_shoulder_pos = pred_output_list[0]["pred_joints_img"][33]
+        l_shoulder_pos = pred_output_list[0]["pred_joints_img"][34]
+        scale_factor = 0.45/np.linalg.norm(l_shoulder_pos - r_shoulder_pos) # 45cm Average shoulder width (Men)
+
+        relative_transform, T_torso, T_wrist = cobot_utils.compute_relative_transformation(joint_positions, joint_rotations, scale_factor)
+
+        torso_position = joint_positions[0]
+        torso_orientation = joint_rotations[0]
+
+        T_wrist = T_torso @ relative_transform # For testing Wrist reconstruction
+        wrist_position = joint_positions[1]
+        wrist_orientation = T_wrist[:3, :3]
+
+        res_img = cobot_utils.draw_axes(res_img, torso_position, torso_orientation, rotation_matrix_flag=True)
+        res_img = cobot_utils.draw_axes(res_img, wrist_position, wrist_orientation, rotation_matrix_flag=True)
+
+        if args.cobot:
+            cobot_utils.proc_time()
+            print("[DEBUG] About to send data to cobot...")
+            cobot_utils.send_data(relative_transform)
+            print("[DEBUG] Sent data successfully.")
+            cobot_utils.proc_time(1)
+
         if not args.no_display:
-            res_img = res_img.astype(np.uint8)
-            ImShow(res_img)
+            cobot_utils.show_image(res_img)
 
         # save result image
-        if args.out_dir is not None:
-            demo_utils.save_res_img(args.out_dir, image_path, res_img)
+        # if args.out_dir is not None:
+        #     demo_utils.save_res_img(args.out_dir, image_path, res_img)
 
         # save predictions to pkl
         if args.save_pred_pkl:
             demo_type = 'body'
             demo_utils.save_pred_to_pkl(
                 args, demo_type, image_path, body_bbox_list, hand_bbox_list, pred_output_list)
-
-        timer.toc(bPrint=True,title="Time")
-        print(f"Processed : {image_path}")
+        timer.toc(average = True, bPrint=True,title="Time")
+        # print(f"Processed : {image_path}")
 
     #save images as a video
     if not args.no_video_out and input_type in ['image_dir', 'video', 'webcam']:
@@ -161,6 +187,7 @@ def run_body_mocap(args, body_bbox_detector, body_mocap, visualizer):
     if input_type =='webcam' and input_data is not None:
         input_data.release()
     cv2.destroyAllWindows()
+    cobot_utils.disconnect_from_cobot()
 
 
 def main():
@@ -171,9 +198,10 @@ def main():
 
     # Set bbox detector
     body_bbox_detector = BodyPoseEstimator()
-
+    args.no_video_out = True
     # Set mocap regressor
     use_smplx = args.use_smplx
+    args.single_person = True
     checkpoint_path = args.checkpoint_body_smplx if use_smplx else args.checkpoint_body_smpl
     print("use_smplx", use_smplx)
     body_mocap = BodyMocap(checkpoint_path, args.smpl_dir, device, use_smplx)

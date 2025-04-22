@@ -16,6 +16,8 @@ import mocap_utils.geometry_utils as gu
 from bodymocap.body_eft import Body_eft
 from bodymocap.utils.imutils import j2d_normalize, conv_bbox_xywh_to_center_scale
 
+import time
+
 class BodyMocap(object):
     def __init__(self, regressor_checkpoint, smpl_dir, device=torch.device('cuda'), use_smplx=False):
 
@@ -38,7 +40,7 @@ class BodyMocap(object):
         #Load pre-trained neural network 
         SMPL_MEAN_PARAMS = './extra_data/body_module/data_from_spin/smpl_mean_params.npz'
         self.model_regressor = hmr(SMPL_MEAN_PARAMS).to(self.device)
-        checkpoint = torch.load(regressor_checkpoint)
+        checkpoint = torch.load(regressor_checkpoint, weights_only = True)
         self.model_regressor.load_state_dict(checkpoint['model'], strict=False)
         self.model_regressor.eval()
         
@@ -104,18 +106,20 @@ class BodyMocap(object):
                 # Convert joint to original image space (X,Y are aligned to image)
                 pred_joints_3d = pred_joints_3d[0].cpu().numpy() # (1,49,3)
                 pred_joints_vis = pred_joints_3d[:,:3]  # (49,3)
+
                 pred_joints_vis_bbox = convert_smpl_to_bbox(pred_joints_vis, camScale, camTrans) 
                 pred_joints_vis_img = convert_bbox_to_oriIm(
                     pred_joints_vis_bbox, boxScale_o2n, bboxTopLeft, img_original.shape[1], img_original.shape[0]) 
-
+                
                 # Output
                 pred_output['img_cropped'] = img[:, :, ::-1]
                 pred_output['pred_vertices_smpl'] = smpl_output.vertices[0].cpu().numpy() # SMPL vertex in original smpl space
                 pred_output['pred_vertices_img'] = pred_vertices_img # SMPL vertex in image space
                 pred_output['pred_joints_img'] = pred_joints_vis_img # SMPL joints in image space
 
-                pred_aa_tensor = gu.rotation_matrix_to_angle_axis(pred_rotmat.detach().cpu()[0])
-                pred_output['pred_body_pose'] = pred_aa_tensor.cpu().numpy().reshape(1, 72)
+                # pred_aa_tensor = gu.rotation_matrix_to_angle_axis(pred_rotmat.detach().cpu()[0])
+
+                # pred_output['pred_body_pose'] = pred_aa_tensor.cpu().numpy().reshape(1, 72)
 
                 pred_output['pred_rotmat'] = pred_rotmat.detach().cpu().numpy() # (1, 24, 3, 3)
                 pred_output['pred_betas'] = pred_betas.detach().cpu().numpy() # (1, 10)
@@ -148,7 +152,6 @@ class BodyMocap(object):
                     pred_output['left_hand_joints_img_coord'] = pred_joints_img
                 
                 pred_output_list.append(pred_output)
-
         return pred_output_list
     
 
@@ -278,13 +281,13 @@ class BodyMocap(object):
                 if self.use_smplx:
                     img_center = np.array((img_original.shape[1], img_original.shape[0]) ) * 0.5
                     # right hand
-                    pred_joints = smpl_output.right_hand_joints[0].cpu().numpy()     
+                    pred_joints = smpl_output.right_hand_joints[0].detach().cpu().numpy()     
                     pred_joints_bbox = convert_smpl_to_bbox(pred_joints, camScale, camTrans)
                     pred_joints_img = convert_bbox_to_oriIm(
                         pred_joints_bbox, boxScale_o2n, bboxTopLeft, img_original.shape[1], img_original.shape[0])
                     pred_output['right_hand_joints_img_coord'] = pred_joints_img
                     # left hand 
-                    pred_joints = smpl_output.left_hand_joints[0].cpu().numpy()
+                    pred_joints = smpl_output.left_hand_joints[0].detach().cpu().numpy()
                     pred_joints_bbox = convert_smpl_to_bbox(pred_joints, camScale, camTrans)
                     pred_joints_img = convert_bbox_to_oriIm(
                         pred_joints_bbox, boxScale_o2n, bboxTopLeft, img_original.shape[1], img_original.shape[0])

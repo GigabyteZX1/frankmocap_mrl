@@ -8,6 +8,8 @@ import sys
 import numpy as np
 import cv2
 
+import time
+
 import torch
 import torchvision.transforms as transforms
 import mocap_utils.general_utils as gnu
@@ -100,9 +102,20 @@ class Third_View_Detector(BodyPoseEstimator):
         cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.3  # 0.3 , use low thresh to increase recall
         self.hand_detector = DefaultPredictor(cfg)
 
+        # Warmup
+        warmup_img = np.zeros((480, 640, 3), dtype=np.uint8)  # HWC format
+        for _ in range(3):
+            _ = self.hand_detector(warmup_img)
+
 
     def __get_raw_hand_bbox(self, img):
-        bbox_tensor = self.hand_detector(img)['instances'].pred_boxes
+        start_time = time.time()
+
+        with torch.amp.autocast('cuda'):  # Enable mixed precision
+            bbox_tensor = self.hand_detector(img)['instances'].pred_boxes
+        torch.cuda.synchronize()  # Accurate GPU timing
+        end_time = time.time()
+        print(f"Hand detector inference time: {end_time - start_time}")
         bboxes = bbox_tensor.tensor.cpu().numpy()
         return bboxes
 
@@ -116,7 +129,10 @@ class Third_View_Detector(BodyPoseEstimator):
                 len(body_bbox) == len(hand_bbox), where hand_bbox can be None if not valid
         '''
         # get body pose
+        start_time = time.time()
         body_pose_list, body_bbox_list = self.detect_body_pose(img)
+        end_time = time.time()
+        print(f"Body pose inference time: {end_time - start_time}")
         # assert len(body_pose_list) == 1, "Current version only supports one person"
 
         # get raw hand bboxes

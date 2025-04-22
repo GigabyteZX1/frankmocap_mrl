@@ -16,18 +16,20 @@ from handmocap.hand_mocap_api import HandMocap
 from handmocap.hand_bbox_detector import HandBboxDetector, Openpose_Hand_Detector
 
 from renderer.viewer2D import ImShow
-import time
+from mocap_utils.timer import Timer
 
+from mrl_cobot.telekinesis_utils import CobotTelekinesis
 
 def run_hand_mocap(args, bbox_detector, hand_mocap, visualizer):
     #Set up input data (images or webcam)
     input_type, input_data = demo_utils.setup_input(args)
- 
-    assert args.out_dir is not None, "Please specify output dir to store the results"
+    cobot_utils = CobotTelekinesis()
     cur_frame = args.start_frame
     video_frame = 0
-
+    timer = Timer()
     while True:
+        timer.tic()
+
         # load data
         load_bbox = False
         openpose_file_path = ''
@@ -62,12 +64,13 @@ def run_hand_mocap(args, bbox_detector, hand_mocap, visualizer):
                 video_frame += 1
                 continue
             # save the obtained video frames
-            image_path = osp.join(args.out_dir, "frames", f"{cur_frame:05d}.jpg")
-            if img_original_bgr is not None:
-                video_frame += 1
-                if args.save_frame:
-                    gnu.make_subdir(image_path)
-                    cv2.imwrite(image_path, img_original_bgr)
+            if args.out_dir is not None:
+                image_path = osp.join(args.out_dir, "frames", f"{cur_frame:05d}.jpg")
+                if img_original_bgr is not None:
+                    video_frame += 1
+                    if args.save_frame:
+                        gnu.make_subdir(image_path)
+                        cv2.imwrite(image_path, img_original_bgr)
         
         elif input_type == 'webcam':
             _, img_original_bgr = input_data.read()
@@ -133,22 +136,26 @@ def run_hand_mocap(args, bbox_detector, hand_mocap, visualizer):
         assert len(body_bbox_list) == len(pred_output_list)
 
         # extract mesh for rendering (vertices in image space and faces) from pred_output_list
-        pred_mesh_list = demo_utils.extract_mesh_from_output(pred_output_list)
+        # pred_mesh_list = demo_utils.extract_mesh_from_output(pred_output_list)
 
         # visualize
-        res_img = visualizer.visualize(
-            img_original_bgr, 
-            pred_mesh_list = pred_mesh_list, 
-            hand_bbox_list = hand_bbox_list)
+        # res_img = visualizer.visualize(
+        #     img_original_bgr, 
+        #     pred_mesh_list = pred_mesh_list, 
+        #     hand_bbox_list = hand_bbox_list)
+        res_img = img_original_bgr
 
         # show result in the screen
         if not args.no_display:
-            res_img = res_img.astype(np.uint8)
-            ImShow(res_img)
+            cobot_utils.show_image(res_img)
+        # show result in the screen
+        # if not args.no_display:
+        #     res_img = res_img.astype(np.uint8)
+        #     ImShow(res_img)
 
         # save the image (we can make an option here)
-        if args.out_dir is not None:
-            demo_utils.save_res_img(args.out_dir, image_path, res_img)
+        # if args.out_dir is not None:
+        #     demo_utils.save_res_img(args.out_dir, image_path, res_img)
 
         # save predictions to pkl
         if args.save_pred_pkl:
@@ -156,7 +163,8 @@ def run_hand_mocap(args, bbox_detector, hand_mocap, visualizer):
             demo_utils.save_pred_to_pkl(
                 args, demo_type, image_path, body_bbox_list, hand_bbox_list, pred_output_list)
 
-        print(f"Processed : {image_path}")
+        timer.toc(bPrint=True, title="Time")
+        # print(f"Processed : {image_path}")
         
     #save images as a video
     if not args.no_video_out and input_type in ['video', 'webcam']:
@@ -174,7 +182,7 @@ def main():
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     assert torch.cuda.is_available(), "Current version only supports GPU"
-
+    args.no_video_out = True
     #Set Bbox detector
     bbox_detector =  HandBboxDetector(args.view_type, device)
 

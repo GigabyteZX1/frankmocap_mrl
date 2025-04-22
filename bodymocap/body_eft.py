@@ -30,7 +30,7 @@ class Body_eft():
 
     def __init__(self, model, smpl):
         #Basic
-        self.smpl_mapping = pickle.load(open("/home/hjoo/codes/handmocap/SMPLX_HAND_INFO.pkl", "rb"))
+        self.smpl_mapping = pickle.load(open("extra_data/hand_module/SMPLX_HAND_INFO.pkl", "rb"))
         
         self.model_regressor = model
 
