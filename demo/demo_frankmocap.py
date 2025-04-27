@@ -7,10 +7,6 @@ import torch
 from torchvision.transforms import Normalize
 import numpy as np
 import cv2
-import argparse
-import json
-import pickle
-import pdb
 
 ############# input parameters  #############
 from demo.demo_options import DemoOptions

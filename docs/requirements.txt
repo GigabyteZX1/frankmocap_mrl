@@ -18,6 +18,7 @@ tensorboardX
 tqdm
 jinja2
 smplx
-sklearn
+scikit-learn
 opendr
 chumpy
+numpy==1.23.0
