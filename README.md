@@ -77,12 +77,12 @@ To ensure stability and smoothness:
 
 ---
 
-### 5. **Inverse Kinematics**
+### 7. **Inverse Kinematics**
 - Final smoothed wrist target pose is converted into **joint angles** using analytical inverse kinematcs equations for Cobot-C1
 
 ---
 
-### 6. **Motion Execution**
+### 8. **Motion Execution**
 - Telekinesis motion is executed by pulishing **JointState** msg on a rostopic using a tuned **PD controller**
 
 ## Result
@@ -93,6 +93,54 @@ This method enables fluid, real-time teleoperation of the robot arm using only a
 - Generalization across users and environments
 
 ## How to Run
+
+### **Prerequisites:**
+- To run Cobot Telekinesis system, make sure to clone and build the Cobo-C1 ROS workspace as well as setup frankmocap-mrl and install appropriate dependencies.
+- In one terminal navigate to *frankmocap-mrl* folder and activate frankmocap conda environment using-
+```
+  conda activate <env_name>
+```
+
+- In another terminal navigate to *Cobot-C1* folder, make sure to source it using
+```
+  source ./devel/setup.bash (or zsh depending on terminal)
+```
+
+### Using Pre-computed Bounding Boxes:
+- If you are using pre-computed bbox use the following command to start the frankmocap script
+```
+  python -m demo.demo_frankmocap --input_path <path to saved bbox folder> --out_dir ./mocap_output --renderer opengl_gui --cobot
+```
+
+- If you haven't computed bounding boxes, you can use this command to pre-compute and save them
+```
+  python -m demo.demo_frankmocap --input_path <path to video> --out_dir ./mocap_output --save_bbox_output --save_frame
+```
+- Bounding boxes and corresponding frames will be saved under *mocap_output* folder
+
+### Using Live video or Webcam:
+- If you want to use a video or webcam and compute bounding boxes on the go, use the following command
+- **Using saved video**
+```
+  python -m demo.demo_frankmocap --input_path <path to video> --out_dir ./mocap_output --renderer opengl_gui --cobot
+```
+- **Using webcam** (Need to be tested)
+```
+  python -m demo.demo_frankmocap --input_path webcam --renderer opengl_gui --cobot
+```
+
+### Run ROS Node
+- After running the *demo_frankmocap* script, it will start the UDP server and wait for cobot client
+- In the other ROS workspace sourced terminal, run the ROS node using the following command
+```
+  python3 ./src/cobo_control/src/cobot_telekinesis.py
+```
+- **NOTE:** Running this ROS Node without running frankmocap script first will result in an error
+
+## CLI Arguments
+- `--cobot` tag enables connection to cobot ROS node for sending transformation matrix and gripper state corresponding to different frames
+- `--visualize` tag can be used for toggling 3D mesh visualization in glViewer (will affect Performance)
+- More information about CLI arguments can be found [Here](https://github.com/GigabyteZX1/frankmocap_mrl/blob/36fdaf474b09a3b67500827ea8c57803cac188b6/demo/demo_options.py#L11)
 
 ## Modifications to Frankmocap
 Since our application required fast close to realtime telekinesis operation, some changes had to be made to Frankmocap pipeline
@@ -106,6 +154,103 @@ Since our application required fast close to realtime telekinesis operation, som
 
 ## Cobot Telekinesis ROS Node
 
+### Components Overview
+
+#### 1. **KalmanFilter**
+
+A simple 5D Kalman Filter for smoothing noisy pose estimates (x, y, z, φ, ψ).
+
+- `apply(measurement)`: Performs the prediction and update steps of the Kalman filter.
+- Helps to stabilize target end-effector poses before IK and control.
+
+#### 2. **CobotTelekinesis**
+
+Main node that handles:
+
+- UDP connection to receive transformation data (e.g., from a headset or external tracker).
+- Kalman filtering to smooth pose commands.
+- Conversion of pose to joint space via inverse kinematics.
+- Sending smoothed joint commands to the robot via ROS.
+
+##### Key Functions
+
+- `__init__()`:
+  - Initializes ROS publishers and subscribers.
+  - Sets default parameters like velocity limits, home pose, etc.
+  - Sets up Kalman filter and data buffers.
+
+- `connect_socket()`:
+  - Establishes a UDP connection to the external transformation data sender.
+  - Sends a handshake and waits for connection confirmation.
+
+- `joint_state_callback(msg)`:
+  - Updates internal state of robot joint positions using ROS topic `/cobo/joint_state_act`.
+
+- `move_to_home()`:
+  - Generates a trajectory from current end effector position to home position or the very first point using cubic or linear interpolation.
+  - Uses `CubicTrajectoryPlanner` or `LinearTrajectoryPlanner`.
+
+- `execute_trajectory(trajectory)`:
+  - Publishes trajectory points (joint positions & velocities) at a defined rate to ROS.
+
+- `read_loop()`:
+  - Continuously listens to the UDP socket.
+  - Handles messages like "CLOSE_CONNECTION".
+  - Buffers and processes JSON messages representing transforms.
+
+- `process_message(message)`:
+  - Decodes 4x4 homogeneous transform matrix from UDP stream.
+  - Extracts Gripper State information
+  - Computes New target pose for the end-effector using **T_robot_torso @ transform matrix**
+  - Extracts the new end-effector pose and applies Kalman filtering.
+  - Computes IK solution for the resulting pose.
+  - Publishes joint commands to `/cobo/joint_command`.
+
+- `extract_target_pose(T_target_robot)`:
+  - Extracts `[x, y, z, φ, ψ]` from a 4x4 matrix.
+  - φ (pitch) and ψ (yaw) are extracted from rotation matrix.
+  - Currently sets ψ to zero as a temporary fix.
+
+- `run()`:
+  - Starts the UDP socket listener in a separate thread.
+  - Spins ROS node.
+
+---
+
+### Logic Flow
+
+```text
+[UDP Transform Data] --> [Extract and Compute Target Pose] --> [Kalman Filter] --> [Pose Extraction] --> [Inverse Kinematics] --> [Joint Angles] --> [Publish JointState]
+```
+
+### ROS Topics
+
+- Publishes:
+  - `/cobo/joint_command` → `JointState` messages to control robot.
+- Subscribes:
+  - `/cobo/joint_state_act` → `JointState` messages for feedback.
+
+---
+
+### Message Format
+
+Incoming messages via UDP should be JSON-encoded 4×4 transformation matrices:
+
+```json
+[[1, 0, 0, 0.1],
+ [0, 1, 0, 0.2],
+ [0, 0, 1, 0.3],
+ [0, 0, 0, 1]]
+```
+
+- The `T[3,3]` field is used to encode the **gripper state** (1=open, 0=closed).
+- This is then reverted to 1 after parsing for pose calculation.
+
+Outgoing message is a ROS message of type JointState having structure as follows:
+- `mode`
+- `position`
+- `velocity`
+- `effort`
 ## Current Pipeline
 
 

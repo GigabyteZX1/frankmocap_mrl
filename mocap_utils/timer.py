@@ -42,7 +42,7 @@ class Timer(object):
         if average:
             if bPrint:
                 # print("Avg Time: {}".format(self.average_time))
-                print("{}: {:0.2f} sec/frame, FPS {:0.2f}".format(title, self.diff, 1.0/self.diff))
+                print("{}: {:0.2f} sec/frame, FPS {:0.2f}, Avg FPS {:0.2f}".format(title, self.diff, 1.0/self.diff, 1.0/self.average_time))
 
             return self.average_time
         else:
