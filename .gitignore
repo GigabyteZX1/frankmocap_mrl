@@ -1,6 +1,5 @@
 *.swp
 *.jpg
-*.png
 smpl/
 tmp/
 pretrained_models/

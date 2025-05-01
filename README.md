@@ -87,14 +87,14 @@ This assumption holds well in practice and simplifies cross-domain retargeting.
 ```
   T_target = T_robot_torso @ relative_transformation_matrix
 ```
-![New Pose Computation](docs/new_pose_comp.png)
+![New Pose Computation](docs/readme_images/new_pose_comp.png)
 - `x,y,z,phi,psi` are then extracted from resulting **T_result**
 ---
 ### 7. **Post-processing**
 To ensure stability and smoothness:
 - **Low-pass filtering** using a **Kalman filter** is done: 
 
-![Kalman Filter](docs/KalmanFilterDiagram.png)
+![Kalman Filter](docs/readme_images/KalmanFilterDiagram.png)
 
 ---
 
@@ -117,14 +117,14 @@ This method enables smooth, real-time teleoperation of the robot arm using only 
 - Below we can see the 3 joints values with and without Kalman filter smoothing
 #### Without Kalman Filter
 
-![withoutKF](docs/withoutKF.png)
+![withoutKF](docs/readme_images/withoutKF.png)
 
 #### With Kalman Filter
 
-![withKF](docs/withKF.png)
+![withKF](docs/readme_images/withKF.png)
 
 ### Test on Recorded Video
-![Test](docs/result.mp4)
+![Test](docs/readme_images/result.mp4)
 
 ## Performance
 
@@ -300,7 +300,7 @@ Outgoing message is a ROS message of type JointState having structure as follows
 - `velocity`
 - `effort`
 ## Current Pipeline
-![Current Pipeline](docs/pipeline.png)
+![Current Pipeline](docs/readme_images/pipeline.png)
 
 ## Future Improvements
 - Further Improve performance for Real Time operation using multiple GPUs for parallel computations
