@@ -101,29 +101,6 @@ class CobotTelekinesis:
         except Exception as e:
             print(f"Error while preparing data: {e}")
 
-    # def disconnect_from_cobot(self):
-    #     """Disconnect from the cobot server.
-    #     Parameters:
-    #         None
-    #     """
-        
-    #     print(f"Connected: {self.connected}")
-    #     if not self.connected:
-    #         print("Not connected to the client.")
-    #         return
-    #     try:
-    #         if self.client_socket is not None:
-    #             print("closing client socket")
-    #             self.client_socket.shutdown(socket.SHUT_RDWR)
-    #             self.client_socket.close()
-    #         if self.server_socket is not None:
-    #             print("closing server socket")
-    #             self.server_socket.shutdown(socket.SHUT_RDWR)
-    #             self.server_socket.close()
-    #         self.connected = False
-    #     except socket.error as e:
-    #         print("Error disconnecting from the server:%s", e)
-
     def disconnect_from_cobot(self):
         """Disconnect from the cobot server.
         Parameters:

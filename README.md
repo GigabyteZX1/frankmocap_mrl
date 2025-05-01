@@ -28,12 +28,15 @@ This assumption holds well in practice and simplifies cross-domain retargeting.
 
 ## Method Overview
 
-### 1. **Body Pose Estimation**
-- Crop of the human body is passed to **FrankMocap** to estimate SMPL-X parameters:
+### 1. **Full Body Pose Estimation using Frankmocap**
+- Given a RGB image, Body and Hands are first detected using a **YOLOv3** detector
+- Crop of the human body and hands are separately passed to a **SPIN** regressor and **Resnet-50** based regressor respectively to estimate SMPL-X parameters:
   - `β_b ∈ ℝ¹⁰`: Body shape
   - `θ_b ∈ ℝ⁴⁵`: Joint rotations (24 joints)
   - `φ_b ∈ ℝ³`: Global orientation
+- Parameter outputs for both body and hands are combined using a **copy paste integration** method
 - Output: Full 3D body mesh, including wrist position and orientation.
+> `Copy Paste Integration Method:` **copies** the relevant hand pose parameters and **pastes** them into the correct position of the SMPL-X body pose vector.
 
 ### 2. **Coordinate Frame Definition**
 
@@ -46,9 +49,23 @@ This assumption holds well in practice and simplifies cross-domain retargeting.
 ##### \* Can be adjusted further
 ---
 
-### 3. **Transformation Extraction**
-- Traverse **human kinematic chain** from torso to wrist (using SMPL-X) to compute the **relative pose** (rotation + translation).
-- This relative wrist pose is then applied to the **robot wrist**, assuming robot torso as the origin.
+### 3. **Relative Transformation Computation**
+- 3D joint positions are extracted directly from **SMPLX** model outputs (appropriately scaled by some factor)
+- Torso orientation is simply extracted from the **SMPLX** model outputs as a Rotation Matrix
+- For getting the wrist orientation
+  - We convert the **global hand pose** estimated from Resnet-50 to **local**
+  - We then traverse **human kinematic chain** from torso to wrist (using SMPL-X) chaining rotations as we move forward to integrate the new **local hand pose** into the kinematic chain.
+  - Above step ensures that we get a robust **hand pose** estimation which is aligned with the parent body
+- After obtaining Torso and Right hand wrist poses, they are converted into **4x4 Homogenous Transformation Matrices** for easier computation.
+- Relative Transformation Matrix is found using:
+```
+  T_relative = Inv(T_torso) @ T_wrist
+```
+- The translation part of resulting matrix is scaled using a scaling factor
+- **Scaling Factor**
+```
+  scale_factor = 0.45/||l_shoulder_pos - r_shoulder_pos|| # 45cm Average shoulder width (Men)
+```
 
 > This sidesteps the need for global alignment and allows a "floating camera" approach.
 
@@ -63,35 +80,66 @@ This assumption holds well in practice and simplifies cross-domain retargeting.
 - **Transformation Matrix** and **Gripper State** is packed and sent to a ROS Node using a **UDP Socket** for further processing and execution.
 - A local socket is used to make it easier to communicate between Frankmocap running in **conda** environment and **ROS** environment.
 - This ensures low-latency communication for real-time robot control.
-
 ---
-### 6. **Post-processing**
+
+### 6. Target Pose Calculation
+- **Relative Transformation** is applied to the Robot torso frame to get the target robot wrist pose as 
+```
+  T_target = T_robot_torso @ relative_transformation_matrix
+```
+![New Pose Computation](docs/new_pose_comp.png)
+- `x,y,z,phi,psi` are then extracted from resulting **T_result**
+---
+### 7. **Post-processing**
 To ensure stability and smoothness:
-- **Low-pass filtering** using an **Kalman filter**: (To add mathematical formulation)
-  ```
-  P_EMA = α * P_new + (1 - α) * P_EMA
-  ```
-  - Typical α = 0.25 for balance between responsiveness and noise smoothing.
+- **Low-pass filtering** using a **Kalman filter** is done: 
 
-- **Transformation** is applied to the Robot torso frame to get the target robot wrist pose
+![Kalman Filter](docs/KalmanFilterDiagram.png)
 
 ---
 
-### 7. **Inverse Kinematics**
+### 8. **Inverse Kinematics**
 - Final smoothed wrist target pose is converted into **joint angles** using analytical inverse kinematcs equations for Cobot-C1
 
 ---
 
-### 8. **Motion Execution**
+### 9. **Motion Execution**
 - Telekinesis motion is executed by pulishing **JointState** msg on a rostopic using a tuned **PD controller**
 
-## Result
+## Results
 
-This method enables fluid, real-time teleoperation of the robot arm using only a monocular camera and passive 3D body estimation, while ensuring:
-- No collisions
+This method enables smooth, real-time teleoperation of the robot arm using only a monocular camera and passive 3D body estimation, while ensuring:
 - Realistic and responsive motion
 - Generalization across users and environments
+- No sudden movements
 
+### Joint Angles Smoothing
+- Below we can see the 3 joints values with and without Kalman filter smoothing
+#### Without Kalman Filter
+
+![withoutKF](docs/withoutKF.png)
+
+#### With Kalman Filter
+
+![withKF](docs/withKF.png)
+
+### Test on Recorded Video
+![Test](docs/result.mp4)
+
+## Performance
+
+The setup was tested on a **Nvidia Tesla T4** 16GB VRAM and **Nvidia RTX 4080 super** 24GB VRAM 
+
+| Setup          |     Parameters        |        FPS           |
+|----------------|-------------------------|------------------------------------------|
+| Nvidia Tesla T4   | Live video without optimization     | 2.5 FPS |
+|                   | Live video with optimization        | 4 FPS   |
+|                   | Pre-computed Bounding Box       | 10 FPS  |
+| Nvidia RTX 4080s  | Live video without optimization      | 8 FPS   |
+|                   | Live video with optimization         | 12 FPS  |
+|                   | Pre-computed Bounding Box        | 16 FPS  |
+
+\* Optimization includes using *multiple precision*, *GPU synchronization* and *vectorized computation*
 ## How to Run
 
 ### **Prerequisites:**
@@ -252,10 +300,12 @@ Outgoing message is a ROS message of type JointState having structure as follows
 - `velocity`
 - `effort`
 ## Current Pipeline
-
+![Current Pipeline](docs/pipeline.png)
 
 ## Future Improvements
-
+- Further Improve performance for Real Time operation using multiple GPUs for parallel computations
+- Change ResNet backbone with updated models for improved detection and decreased inference time
+- Shift to **ROS2** to make use of native DDS
 ## References
 The main idea behind this project is taken from this paper
 ```
@@ -267,5 +317,17 @@ The main idea behind this project is taken from this paper
       archivePrefix={arXiv},
       primaryClass={cs.RO},
       url={https://arxiv.org/abs/2202.10448}, 
+}
+```
+Monocular Pose Estimation is taken from works on Frankmocap paper
+```
+@misc{rong2020frankmocapfastmonocular3d,
+      title={FrankMocap: Fast Monocular 3D Hand and Body Motion Capture by Regression and Integration}, 
+      author={Yu Rong and Takaaki Shiratori and Hanbyul Joo},
+      year={2020},
+      eprint={2008.08324},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2008.08324}, 
 }
 ```
