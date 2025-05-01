@@ -124,7 +124,7 @@ This method enables smooth, real-time teleoperation of the robot arm using only 
 ![withKF](docs/readme_images/withKF.png)
 
 ### Test on Recorded Video
-![Test](docs/readme_images/result.mp4)
+![Test](docs/result.mp4)
 
 ## Performance
 
