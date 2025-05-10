@@ -1,441 +1,392 @@
-#!/usr/bin/env python3
+# Copyright (c) Facebook, Inc. and its affiliates.
 
-""" 
-This script defines a ROS node that connects to a socket server to receive transformation matrices, 
-converts them to ROS `TransformStamped` messages, and publishes them to a specified topic.
-The node continuously reads data from the socket, processes the received JSON-encoded transformation matrices,
-and publishes the corresponding transformations.
-
-Author: Emaad Ahmed
-Date: March 2025
-"""
-
-import rospy
-import socket
-import json
-import numpy as np
-import threading
+import os
 import sys
-import errno
-from scipy.spatial.transform import Rotation as R
-from Cobot import Cobot
-from cobo_msgs.msg import Trajectory, JointState
-from TrajectoryPlanners import LinearTrajectoryPlanner, CubicTrajectoryPlanner
+import os.path as osp
+import torch
+from torchvision.transforms import Normalize
+import numpy as np
+import cv2
+import argparse
+import json
+import pickle
+import pdb
 
-from collections import deque
-# import matplotlib
-# import matplotlib.pyplot as plt
-# from matplotlib.animation import FuncAnimation
-# matplotlib.use('TkAgg')
-# import pyqtgraph as pg
-# from pyqtgraph.Qt import QtCore, QtWidgets
+############# input parameters  #############
+from demo.demo_options import DemoOptions
+from bodymocap.body_mocap_api import BodyMocap
+from handmocap.hand_mocap_api import HandMocap
+import mocap_utils.demo_utils as demo_utils
+import mocap_utils.general_utils as gnu
+from mocap_utils.timer import Timer
+from datetime import datetime
+from bodymocap.body_bbox_detector import BodyPoseEstimator
+from handmocap.hand_bbox_detector import HandBboxDetector, Openpose_Hand_Detector
+from integration.copy_and_paste import integration_copy_paste
+from integration.eft import integration_eft_optimization
+from renderer import glViewer
+from mrl_cobot.telekinesis_utils import CobotTelekinesis
 
-#Plotter class
-class RealTimePlotter:
-    def __init__(self, telekinesis_instance):
-        self.telekinesis = telekinesis_instance
+def __filter_bbox_list(body_bbox_list, hand_bbox_list, single_person):
+    # (to make the order as consistent as possible without tracking)
+    bbox_size =  [ (x[2] * x[3]) for x in body_bbox_list]
+    idx_big2small = np.argsort(bbox_size)[::-1]
+    body_bbox_list = [ body_bbox_list[i] for i in idx_big2small ]
+    hand_bbox_list = [hand_bbox_list[i] for i in idx_big2small]
 
-        self.data_keys = ['x', 'y', 'z', 'phi', 'psi']
-        self.colors = ['r', 'g', 'b', 'm', 'c']
-             
-        self.fig, self.ax = plt.subplots(figsize=(8, 6))
+    if single_person and len(body_bbox_list)>0:
+        body_bbox_list = [body_bbox_list[0], ]
+        hand_bbox_list = [hand_bbox_list[0], ]
 
-        self.pose_lines = {}
-        
-        for key, color in zip(self.data_keys, self.colors):
-            line, = self.ax.plot([], [], label=key, color=color)
-            self.pose_lines[key] = line
-
-        self.ax.set_xlim(0, 100)
-        self.ax.set_ylim(-1.5, 1.5)
-        self.ax.set_title("Real-time EE Pose")
-        self.ax.set_xlabel("Time steps")
-        self.ax.set_ylabel("Value")
-        self.ax.legend()        
-
-        self.ani = FuncAnimation(self.fig, self.update_plot, interval=200)
-        plt.ion()
-        plt.tight_layout()
-        plt.show()
-
-    def update_plot(self, frame):
-        for key in self.data_keys:
-            data = self.telekinesis.ee_pose_history[key][-100:]  # Only keep latest 100
-            x_vals = list(range(len(data)))
-            self.pose_lines[key].set_data(x_vals, data)
-        
-        self.ax.relim()
-        self.ax.autoscale_view()
-        
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
+    return body_bbox_list, hand_bbox_list
 
 
-class KalmanFilter:
-    def __init__(self, process_variance=1e-4, measurement_variance=1e-1):
-        self.A = np.eye(5)  # State transition matrix
-        self.H = np.eye(5)  # Measurement matrix
-        self.Q = np.eye(5) * process_variance  # Process noise covariance
-        self.R = np.eye(5) * measurement_variance  # Measurement noise covariance
-        self.P = np.eye(5)  # Covariance matrix
-        self.x = np.zeros(5)  # State estimate
+def run_regress(
+    args, img_original_bgr, 
+    body_bbox_list, hand_bbox_list, bbox_detector,
+    body_mocap, hand_mocap,
+    openpose_file_path, cobot_utils,
+    openpose_kp_imgcoord = None,  # Required for optimization-based integration
+):
+    cond1 = len(body_bbox_list) > 0 and len(hand_bbox_list) > 0
+    cond2 = not args.frankmocap_fast_mode
 
-    def apply(self, measurement):
-        """
-        Apply Kalman filtering to smooth the input measurement.
-        """
-        # Prediction step
-        self.x = self.A @ self.x
-        self.P = self.A @ self.P @ self.A.T + self.Q
-
-        # Measurement update step
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman Gain
-        y = measurement - (self.H @ self.x)  # Innovation
-        self.x = self.x + K @ y
-        self.P = (np.eye(5) - K @ self.H) @ self.P  # Update covariance
-
-        return self.x
-
-class CobotTelekinesis:
-    def __init__(self, host='localhost', port=60001):
-        self.host = host
-        self.port = port
-        self.sock = None
-        self.buffer = b""
-        self.connected = False
-        self.lock = threading.Lock()
-        self.cobot = Cobot()
-
-        # ROS publisher for TransformStamped messages.
-        self.pub = rospy.Publisher('/cobo/joint_command', JointState, queue_size=1)
-        self.joint_state_act_sub = rospy.Subscriber('/cobo/joint_state_act', JointState, self.joint_state_callback)
-
-        # Initialize the current joint states.
-        self.current_joints = np.zeros(6)
-        self.joint_velocities = np.zeros(6)
-        self.home_joints = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        
-        # Motion parameters
-        self.default_duration = 3.0  # seconds
-        self.default_dt = 0.002  # seconds
-        self.max_velocity = np.array([5, 5, 5, 1, 1, 1])  # rad/s
-
-        # Trajectory execution
-        self.current_trajectory = None
-        self.trajectory_index = 0
-        self.trajectory_active = False
-        self.control_rate = 500  # Hz
-        self.current_ee_pose = None
-
-        self.first_point_flag = False
-
-        # Planner
-        self.planner_type = "cubic"  # or "linear"
-
-        # Plotter parameters
-        self.filter_window = 5
-        self.ee_pose_buffers = {
-           'x': deque(maxlen=self.filter_window),
-           'y': deque(maxlen=self.filter_window),
-           'z': deque(maxlen=self.filter_window),
-           'phi': deque(maxlen=self.filter_window),
-           'psi': deque(maxlen=self.filter_window)}
-
-        self.ee_pose_history = {
-         'x': [],
-        'y': [],
-        'z': [],
-        'phi': [],
-        'psi': []}
-        
-        # Kalman Filter
-        self.kalman_filter = KalmanFilter(process_variance=1e-3)
-
-    def connect_socket(self, max_retries=5, retry_delay=2):
-        """
-        Connect to the server using UDP protocol.
-        """
-        retries = 0
-        while retries < max_retries and not rospy.is_shutdown():
-            try:
-                # Create UDP socket
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                
-                self.sock.connect((self.host, self.port))
-                
-                # Send an initial packet to establish communication
-                self.sock.send(b"client_hello\n")
-                
-                self.connected = True
-                rospy.loginfo(f"UDP client ready, sending to {self.host}:{self.port}")
-                return True
-                
-            except socket.error as e:
-                rospy.logwarn(f"Connection attempt {retries+1}/{max_retries} failed: {e}")
-                retries += 1
-                rospy.sleep(retry_delay)
-                
-        rospy.logerr("Failed to establish UDP communication with server")
-        return False
-
-
-    def joint_state_callback(self, msg):
-        """Callback to update current joint states."""
-        self.current_joints = np.array(msg.position)
-
-    def move_to_home(self, joint_pos = None):
-        """Move the robot to the home position."""
-
-        if not np.any(joint_pos):
-            rospy.loginfo("Retargetting completed. Moving to home position.")
-            joint_pos = self.home_joints
-
-        # Create trajectory to home position
-        if self.planner_type == "cubic":
-            planner = CubicTrajectoryPlanner(
-                self.current_joints, 
-                joint_pos, 
-                self.default_duration,
-                self.default_dt,
-                self.max_velocity
-            )
+    # use pre-computed bbox or use slow detection mode
+    if cond1 or cond2:
+        if (not cond1) and cond2:
+            # run detection only when bbox is not available
+            print("Run detection...")
+            cobot_utils.proc_time()
+            body_pose_list, body_bbox_list, hand_bbox_list, _ = \
+                bbox_detector.detect_hand_bbox(img_original_bgr.copy())
+            cobot_utils.proc_time(1)
+            # use openpose bbox
         else:
-            planner = LinearTrajectoryPlanner(
-                self.current_joints, 
-                joint_pos, 
-                self.default_duration,
-                self.default_dt,
-                max_velocity=self.max_velocity,
-                use_trapezoidal=False 
-            )
-        
-        # Generate and execute trajectory
-        self.execute_trajectory(planner.generate_trajectory())
+            print("Use pre-computed bounding boxes")
+        assert len(body_bbox_list) == len(hand_bbox_list)
 
-        if not self.trajectory_active and not rospy.is_shutdown():
-            rospy.loginfo("Reached Home")
+        if len(body_bbox_list) < 1: 
+            return list(), list(), list()
 
-    def execute_trajectory(self, trajectory):
-        """Prepare trajectory for execution."""
-        self.current_trajectory = trajectory
-        self.trajectory_index = 0
-        self.trajectory_active = True
+        # sort the bbox using bbox size 
+        # only keep one bbox if args.single_person is set
+        body_bbox_list, hand_bbox_list = __filter_bbox_list(
+            body_bbox_list, hand_bbox_list, args.single_person)
 
-        if self.current_trajectory is None:
-            return
+        if args.use_openpose_bbox:
+            assert openpose_file_path != '' and osp.exists(openpose_file_path)
+            assert cond2, "Do not use openpose prediction in fm fast mode."
+            assert args.single_person
+            op_hand_bbox_list = Openpose_Hand_Detector.detect_hand_bbox(openpose_file_path, img_original_bgr)
+            res_hand_bbox_list = [dict(left_hand = None, right_hand=None),]
+            for hand_type in ['left_hand', 'right_hand']:
+                if op_hand_bbox_list[0][hand_type] is None and hand_bbox_list[0][hand_type] is not None:
+                    res_hand_bbox_list[0][hand_type] = hand_bbox_list[0][hand_type]
+                else:
+                    res_hand_bbox_list[0][hand_type] = op_hand_bbox_list[0][hand_type]
+            hand_bbox_list = res_hand_bbox_list
 
-        rospy.loginfo("Executing trajectory...")
-        # Get current trajectory point
-        while self.trajectory_index < len(self.current_trajectory.time_points):
-            joint_state_ref = JointState()
-            joint_state_ref.mode = 1
-            joint_state_ref.position = self.current_trajectory.positions[:, self.trajectory_index].tolist()
-            joint_state_ref.velocity = self.current_trajectory.velocities[:, self.trajectory_index].tolist()
-            joint_state_ref.effort = np.zeros_like(self.home_joints).tolist()
-            
-            self.pub.publish(joint_state_ref)
-            self.trajectory_index += 1
-            rospy.sleep(1.0 / self.control_rate)
+        # hand & body pose regression
+        pred_hand_list = hand_mocap.regress(
+            img_original_bgr, hand_bbox_list, add_margin=True)
 
-        # Trajectory complete
-        self.trajectory_active = False
-        self.current_trajectory = None
+        pred_body_list = body_mocap.regress(img_original_bgr, body_bbox_list)
 
-    def read_loop(self):
-        """
-        Continuously read data from the UDP socket. Messages are assumed to be newline-delimited.
-        """
-        while not rospy.is_shutdown() and self.connected:
-            try:
-                # Set a timeout to allow checking for shutdown
-                self.sock.settimeout(1.0)
+        assert len(hand_bbox_list) == len(pred_hand_list)
+        assert len(pred_hand_list) == len(pred_body_list)
+
+    else:
+        _, body_bbox_list = bbox_detector.detect_body_bbox(img_original_bgr.copy())
+
+        if len(body_bbox_list) < 1: 
+            return list(), list(), list()
+
+        # sort the bbox using bbox size 
+        # only keep on bbox if args.single_person is set
+        hand_bbox_list = [None, ] * len(body_bbox_list)
+        body_bbox_list, _ = __filter_bbox_list(
+            body_bbox_list, hand_bbox_list, args.single_person)
+
+        # body regression first         
+        pred_body_list = body_mocap.regress(img_original_bgr, body_bbox_list)
+        assert len(body_bbox_list) == len(pred_body_list)        
+        # get hand bbox from body
+        hand_bbox_list = body_mocap.get_hand_bboxes(pred_body_list, img_original_bgr.shape[:2])
+        assert len(pred_body_list) == len(hand_bbox_list)
+
+        # hand regression
+        pred_hand_list = hand_mocap.regress(
+            img_original_bgr, hand_bbox_list, add_margin=True)
+        assert len(hand_bbox_list) == len(pred_hand_list) 
+
+    # integration by copy-and-paste
+    if args.integrate_type=='copy_paste':
+        print("Run copy-paste integration")
+        cobot_utils.proc_time()
+        integral_output_list = integration_copy_paste(
+            pred_body_list, pred_hand_list, body_mocap.smpl, img_original_bgr.shape)
+        cobot_utils.proc_time(1)
+    # Optimization
+    else:   
+        print("Run optimization-based integration")
+        integral_output_list = integration_eft_optimization(
+            body_mocap, pred_body_list, pred_hand_list, 
+            body_bbox_list, openpose_kp_imgcoord, 
+            img_original_bgr, is_debug_vis=args.is_opt_debug_vis)
+    
+    return body_bbox_list, hand_bbox_list, integral_output_list
+
+
+def run_frank_mocap(args, bbox_detector, body_mocap, hand_mocap, visualizer, cobot_utils):
+    #Setup input data to handle different types of inputs
+    input_type, input_data = demo_utils.setup_input(args)
+    gripper_state_history = [True] * 7
+
+    if args.cobot:
+        cobot_utils.connect_to_cobot(('localhost', 60001))
+    cur_frame = args.start_frame
+    video_frame = 0
+    timer = Timer()
+
+    # Use video without frame skipping for saving bbox
+    if not args.save_bbox_output:
+        if input_type == 'bbox_dir':
+            frame_skip = 2
+        else:
+            frame_skip = 3   
+
+    frame_counter=0
+
+    try:
+        while True:
+            timer.tic()
+            frame_counter += 1
+
+            # load data
+            load_bbox = False
+            openpose_file_path = ''
+            openpose_imgcoord = None
+
+            if input_type =='image_dir':
+                if cur_frame < len(input_data):
+                    image_path = input_data[cur_frame]
+                    img_original_bgr  = cv2.imread(image_path)
+                else:
+                    img_original_bgr = None
+
+                if args.use_openpose_bbox or args.integrate_type == 'opt':
+                    # Note: current openpose name should be {raw_image_name}_keypoints.json
+                    f_name = os.path.basename(image_path)[:-4] + "_keypoints.json"
+                    openpose_file_path = os.path.join(args.openpose_dir, f_name)
+                    assert os.path.exists(openpose_file_path), openpose_file_path
+
+                # Optimization based integration. This requires openpose prediction
+                if args.integrate_type=='opt':
+                    print(f"Loading openpose data from: {openpose_file_path}")
+                    # TODO: this works for single person in the image
+                    openpose_imgcoord, _ = demo_utils.read_openpose_wHand(openpose_file_path, dataset='coco')
+                    assert openpose_imgcoord is not None
+
+            elif input_type == 'bbox_dir':
+                if cur_frame < len(input_data):
+                    image_path = input_data[cur_frame]['image_path']
+                    hand_bbox_list = input_data[cur_frame]['hand_bbox_list']
+                    body_bbox_list = input_data[cur_frame]['body_bbox_list']
+                    img_original_bgr  = cv2.imread(image_path)
+                    load_bbox = True
+                else:
+                    img_original_bgr = None
+
+            elif input_type == 'video':      
+                _, img_original_bgr = input_data.read()
+
+                if img_original_bgr is not None:
+                    img_original_bgr = cobot_utils.resize_image(img_original_bgr, target_height = 480)
+                else:
+                    print("All frames processed")
                 
-                try:
-                    # Receive data with sender address
-                    data, server_address = self.sock.recvfrom(1024)
-                    
-                    # Store server address if needed
-                    if not hasattr(self, 'server_address') or not self.server_address:
-                        self.server_address = server_address
-                        rospy.loginfo(f"Connected to server at {server_address}")
-                    
-                    if not data:
-                        continue
-                    
-                    # Check if this is a disconnect command
-                    try:
-                        # Parse the JSON message
-                        message = json.loads(data.decode('utf-8').strip())
-                        if isinstance(message, dict) and message.get("command") == "CLOSE_CONNECTION":
-                            rospy.loginfo("Received disconnect command from server")
-                            self.connected = False
-                            self.move_to_home()
-                            break
-                    except json.JSONDecodeError:
-                        pass
-                    
-                    # Process as regular data
-                    with self.lock:
-                        self.buffer += data
-                    
-                    # Process all complete messages in the buffer
-                    while b'\n' in self.buffer:
-                        with self.lock:
-                            line, self.buffer = self.buffer.split(b'\n', 1)
-                        if line:
-                            self.process_message(line)
-                
-                except socket.timeout:
-                    # Timeout is used just to allow checking for shutdown
+                if video_frame < cur_frame:
+                    video_frame += 1
                     continue
-                    
-            except Exception as e:
-                import errno
-                rospy.logerr(f"Error in UDP socket read loop: {e}")
-                # For other errors, log but continue
-                rospy.logwarn(f"Continuing after error: {e}")
-        
-        self.sock.close()
-        rospy.loginfo("Disconnected from server, socket closed")
+            # save the obtained video frames
+                if args.out_dir is not None:
+                    image_path = osp.join(args.out_dir, "frames", f"{cur_frame:05d}.jpg")
+                    if img_original_bgr is not None:
+                        video_frame += 1
+                        if args.save_frame:
+                            gnu.make_subdir(image_path)
+                            cv2.imwrite(image_path, img_original_bgr)
             
-    def process_message(self, message):
-        """
-        Deserialize the JSON message
-        """
-        try:
-            # Decode the message from bytes to string and then load it as JSON.
-            transform_list = json.loads(message.decode('utf-8'))
-            relative_transform = np.array(transform_list)
+            elif input_type == 'webcam':
+                _, img_original_bgr = input_data.read()
 
-            # Extract Gripper State
-            gripper_state = relative_transform[3,3]
-            relative_transform[3, 3] = 1 # Reverting to original value
+                # if img_original_bgr is not None:
+                #     img_original_bgr = cobot_utils.resize_image(img_original_bgr, target_height = 480)
+                # else:
+                #     print("All frames processed")
 
-            if relative_transform.shape != (4, 4):
-                rospy.logwarn("Received matrix does not have shape (4, 4). Ignoring message.")
-                return
+                if video_frame < cur_frame:
+                    video_frame += 1
+                    continue
+                # save the obtained video frames
+                image_path = osp.join(args.out_dir, "frames", f"scene_{cur_frame:05d}.jpg")
+                if img_original_bgr is not None:
+                    video_frame += 1
+                    if args.save_frame:
+                        gnu.make_subdir(image_path)
+                        cv2.imwrite(image_path, img_original_bgr)
+            else:
+                assert False, "Unknown input_type"
+
+            # Skipping Frame
+            if not args.save_bbox_output:
+                if frame_counter % frame_skip != 0:
+                    cur_frame += 1
+                    timer.toc(average=True, bPrint=False)
+                    continue
+            else:
+                cur_frame += 1 # Progress normally
+
+            if img_original_bgr is None or cur_frame > args.end_frame:
+                break   
+            print("--------------------------------------")
             
-            print("\n=== [DEBUG] New Relative Transform Received ===")
-            print("Relative Transform:\n", relative_transform)
-            print("Current Joint States:", self.current_joints)
-            self.current_ee_pose = self.cobot.forward_kinematics(self.current_joints[:5])
-            print("Current Robot EE Pose:", self.current_ee_pose)
-
-            # Clamping factor as per the max reach of cobot
-            robot_max_reach = 0.811
-
-            T_robot_torso = np.eye(4)
-            T_robot_torso[2,3] = -0.1 # Adjusting Robot Torso Height
-            T_robot_torso[1,3] = 0.15 # Adjusting Robot Torso Position
-            T_target = T_robot_torso @ relative_transform
-
-            ee_target_pos = self.extract_target_pose(T_target)
-            print("Target EE Pose:", ee_target_pos)
-
-            # Applying Kalman Filter to smooth the target pose
-            ee_target_pos = self.kalman_filter.apply(ee_target_pos)
-
-            xyz = ee_target_pos[:3]
-
-            clamped_xyz = np.clip(xyz, -robot_max_reach, robot_max_reach)
-            ee_target_pos[:3] = clamped_xyz
-            if not np.allclose(xyz, clamped_xyz):
-                rospy.logwarn(f"[Clamped] Target EE Pose exceeded robot max reach on one or more axes. Clamped to {clamped_xyz}")
-
-            x, y, z, phi, psi = ee_target_pos
-            self.ee_pose_history['x'].append(x)
-            self.ee_pose_history['y'].append(y)
-            self.ee_pose_history['z'].append(z)
-            self.ee_pose_history['phi'].append(phi)
-            self.ee_pose_history['psi'].append(psi)
-
-            #Solve IK
-            ik_result = self.cobot.inverse_kinematics(ee_target_pos)
-            if ik_result is None:
-               rospy.logwarn("IK failed for pose:", ee_target_pos)
-               return
+            # bbox detection
+            if not load_bbox:
+                body_bbox_list, hand_bbox_list = list(), list()
             
-            ik_result[4] = np.pi/2
-            ik_result = np.append(ik_result, 0.0 if gripper_state == 1 else 1.0) # Adding gripper angle
-            print("IK Result:", np.hstack(ik_result))
+            # regression (includes integration)
+            # openpose_imgcoord is required for optimization-based integration
 
-            if not self.first_point_flag:
-                rospy.loginfo("Moving to First point..")
-                self.move_to_home(np.vstack(ik_result))
-                self.first_point_flag = True
-                # rospy.sleep(1)
+            body_bbox_list, hand_bbox_list, pred_output_list = run_regress(
+                args, img_original_bgr, 
+                body_bbox_list, hand_bbox_list, bbox_detector,
+                body_mocap, hand_mocap,
+                openpose_file_path, cobot_utils, openpose_imgcoord)    
 
-            target_msg = JointState()
-            target_msg.mode = 1
-            target_msg.position = np.vstack(ik_result)
-            target_msg.velocity = np.array([0.1]*5)
-            target_msg.effort = np.zeros(5)
+            # save the obtained body & hand bbox to json file
+            if args.save_bbox_output: 
+                demo_utils.save_info_to_json(args, image_path, body_bbox_list, hand_bbox_list)
+                timer.toc(average = True, bPrint=True, title="Time")
+                continue
 
-            self.pub.publish(target_msg)
-            print(target_msg)
-            print("Published JointState to robot.")
+            if len(body_bbox_list) < 1: 
+                print(f"No body deteced: {image_path}")
+                continue
             
-        except Exception as e:
-            rospy.logerr("Failed to process message: {}".format(e))
+            # visualization
+            if args.visualize:
+                pred_mesh_list = demo_utils.extract_mesh_from_output(pred_output_list)
+                res_img = visualizer.visualize(
+                    img_original_bgr,
+                    pred_mesh_list = pred_mesh_list,
+                    body_bbox_list = body_bbox_list,
+                    hand_bbox_list = hand_bbox_list)
+
+            res_img = img_original_bgr
+
+            # Telekinesis
+            joint_indices = [0] # Pelvic (Torso)
+            joint_positions_indices = [39, 31] 
+            hand_indices = [4, 8] # Thumb and Index finger tip
+            # print(pred_output_list[0])
+            joint_rotations = cobot_utils.extract_joint_data(pred_output_list[0]["pred_rotmat"], joint_indices, 1)
+            joint_positions = cobot_utils.extract_joint_data(pred_output_list[0]["pred_body_joints_img"], joint_positions_indices, 0)
+            hand_joint_position = cobot_utils.extract_joint_data(pred_output_list[0]["pred_rhand_joints_img"], hand_indices, 0)
+
+            r_shoulder_pos = pred_output_list[0]["pred_body_joints_img"][33]
+            l_shoulder_pos = pred_output_list[0]["pred_body_joints_img"][34]
+
+            scale_factor = 0.45/np.linalg.norm(l_shoulder_pos - r_shoulder_pos) # 45cm Average shoulder width (Men)
+            joint_rotations.append(pred_output_list[0]["right_hand_global_orient_body"]) # Wrist
+            
+            relative_transform, T_torso, T_wrist = cobot_utils.compute_relative_transformation(joint_positions, joint_rotations, scale_factor)
+            current_raw_gripper_state = cobot_utils.isGripperClosed(hand_joint_position, threshold = 20)
+
+            gripper_state_history.pop(0)
+            gripper_state_history.append(current_raw_gripper_state)
+
+            #sliding window tracker for the gripper state
+            if not any(gripper_state_history):
+                gripper_state = False
+            else:
+                gripper_state = True
+            relative_transform[3,3] = int(gripper_state)
+            print("Gripper State: ", gripper_state)
+
+        # show result in the screen
+            if not args.no_display:
+                torso_position = joint_positions[0]
+                torso_orientation = joint_rotations[0]
+                res_img = cobot_utils.draw_axes(res_img, torso_position, torso_orientation, rotation_matrix_flag=True)
+
+                # T_wrist = T_torso @ relative_transform # For testing Wrist reconstruction
+
+                wrist_position = joint_positions[1]
+                wrist_orientation = pred_output_list[0]["right_hand_global_orient_body"]
+                # cobot_utils.convert_to_euler(wrist_orientation)
+                res_img = cobot_utils.draw_axes(res_img, wrist_position, wrist_orientation, rotation_matrix_flag=True)
+                cobot_utils.show_image(res_img)
+
+            if args.cobot:
+                cobot_utils.send_data(relative_transform)
+
+            # save result image
+            # if args.out_dir is not None:
+            #     demo_utils.save_res_img(args.out_dir, image_path, res_img)
+
+            # save predictions to pkl
+            if args.save_pred_pkl:
+                demo_type = 'frank'
+                demo_utils.save_pred_to_pkl(
+                    args, demo_type, image_path, body_bbox_list, hand_bbox_list, pred_output_list)
+
+            timer.toc(average = True, bPrint=True,title="Time")
+
+            if input_type in ['image_dir', 'bbox_dir']:
+                print(f"Processed frame: {cur_frame}/{len(input_data)}")
+
+        # cobot_utils.plot_and_save_orientation()
+
+        # save images as a video
+        if not args.no_video_out and input_type in ['image_dir','video', 'webcam']:
+            demo_utils.gen_video_out(args.out_dir, args.seq_name)
+
+        if input_type =='webcam' and input_data is not None:
+            input_data.release()
+
+        cobot_utils.disconnect_from_cobot()
     
-    def extract_target_pose(self, T_target_robot):
-        """
-        Extract target x, y, z, phi, psi from the 4x4 homogeneous transformation matrix.
-        """
-        # Extract Position
-        x = T_target_robot[0, 3]
-        y = T_target_robot[1, 3]
-        z = T_target_robot[2, 3]
-        
-        # Extract Rotation Matrix
-        R_target = T_target_robot[:3, :3]
+    # Catch errors
+    except (KeyboardInterrupt, ValueError, KeyError, TypeError) as e:
+        print("Error: ", e)
+        print("Exiting..\n Closing cobot connection")
+        cobot_utils.disconnect_from_cobot()
 
-        # Reversed
-        psi = np.arctan2(R_target[2, 1], R_target[2, 2])
-        phi = np.arctan2(-R_target[2, 0], np.sqrt(R_target[2, 1]**2 + R_target[2, 2]**2))
 
-        # Convert Radians to Degrees
-        # phi = np.degrees(phi)
-        psi = np.degrees(psi)
-        print("raw_phi: {:.2f}, raw_psi: {:.2f}".format(phi, psi))
-        
-        # Temporary fix for phi and psi
-        # phi = 0
-        psi = 0
-        
-        return np.array([x, y, z, phi, psi])
+def main():
+    args = DemoOptions().parse()
+    args.use_smplx = True
+    args.single_person = True
+    args.no_video_out = True
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    assert torch.cuda.is_available(), "Current version only supports GPU"
 
-    def run(self):
-        """
-        Connect to the socket server, start the read loop in a separate thread,
-        and keep the node running.
-        """
-        self.connect_socket()
-        if not self.connected:
-            rospy.logerr("Could not establish socket connection. Exiting node.")
-            return
+    hand_bbox_detector =  HandBboxDetector('third_view', device)
+    #Set Mocap regressor
+    body_mocap = BodyMocap(args.checkpoint_body_smplx, args.smpl_dir, device = device, use_smplx= True)
+    hand_mocap = HandMocap(args.checkpoint_hand, args.smpl_dir, device = device)
 
-        # Start reading in a separate thread to avoid blocking the main ROS loop.
-        read_thread = threading.Thread(target=self.read_loop)
-        read_thread.daemon = True
-        read_thread.start()
+    # Set Visualizer
+    if args.renderer_type in ['pytorch3d', 'opendr']:
+        from renderer.screen_free_visualizer import Visualizer
+    else:
+        from renderer.visualizer import Visualizer
+    visualizer = Visualizer(args.renderer_type)
 
-        rospy.loginfo("SocketTransformPublisher is running. Spinning rospy ...")
-        rospy.spin()
+    cobot_utils = CobotTelekinesis()
+    run_frank_mocap(args, hand_bbox_detector, body_mocap, hand_mocap, visualizer, cobot_utils)
 
-        # On shutdown, close the socket.
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-    
-    
-if __name__ == "__main__":
-    rospy.init_node('cobot_telekinesis_node', anonymous=True)
-    node = CobotTelekinesis()
-    # plotter=RealTimePlotter(node)
-    # threading.Thread(target=node.run, daemon=True).start()
-    # while not rospy.is_shutdown():
-    #     plt.pause(0.1)
-    node.run()
+
+if __name__ == '__main__':
+    main()
