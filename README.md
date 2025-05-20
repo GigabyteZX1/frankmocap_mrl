@@ -126,6 +126,10 @@ This method enables smooth, real-time teleoperation of the robot arm using only 
 ### Test on Recorded Video
 https://github.com/user-attachments/assets/de8d8c0e-ca2a-4425-b191-e8b7b2df2c8c
 
+### Test on Real Hardware with Realtime feed
+https://github.com/user-attachments/assets/17d2ef71-293e-4b4d-88df-33ad9599b522
+
+
 ## Performance
 
 The setup was tested on a **Nvidia Tesla T4** 16GB VRAM and **Nvidia RTX 4080 super** 24GB VRAM 
